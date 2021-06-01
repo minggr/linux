@@ -1778,6 +1778,42 @@ unlock:
 	return error;
 }
 
+/* Borrow code from old filemap_xip.c */
+static void shmem_unmap_nofault_page(struct address_space *mapping,
+				     unsigned long pgoff)
+{
+	struct vm_area_struct *vma;
+	struct mm_struct *mm;
+	unsigned long address;
+	pte_t *pte;
+	pte_t pteval;
+	spinlock_t *ptl;
+	struct page *page = ZERO_PAGE(0);
+
+	i_mmap_lock_read(mapping);
+	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
+		if (!(vma->vm_flags & VM_NOSIGBUS))
+			continue;
+
+		mm = vma->vm_mm;
+		address = vma->vm_start +
+			((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+		BUG_ON(address < vma->vm_start || address >= vma->vm_end);
+		pte = get_locked_pte(mm, address, &ptl);
+                if (pte) {
+			/* Nuke the page table entry. */
+			flush_cache_page(vma, address, pte_pfn(*pte));
+			pteval = ptep_clear_flush(vma, address, pte);
+			page_remove_rmap(page, false);
+			dec_mm_counter(mm, MM_FILEPAGES);
+			BUG_ON(pte_dirty(pteval));
+			pte_unmap_unlock(pte, ptl);
+                        put_page(page);
+                }
+	}
+	i_mmap_unlock_read(mapping);
+}
+
 /*
  * shmem_getpage_gfp - find page in cache, or get from swap, or allocate
  *
@@ -1812,7 +1848,17 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 repeat:
 	if (sgp <= SGP_CACHE &&
 	    ((loff_t)index << PAGE_SHIFT) >= i_size_read(inode)) {
-		return -EINVAL;
+		if (!vma || !(vma->vm_flags & VM_NOSIGBUS))
+			return -EINVAL;
+
+		vma->vm_flags |= VM_MIXEDMAP;
+		error = vm_insert_page(vma, (unsigned long)vmf->address,
+					ZERO_PAGE(0));
+		if (error)
+			return error;
+
+		*fault_type = VM_FAULT_NOPAGE;
+		return 0;
 	}
 
 	sbinfo = SHMEM_SB(inode->i_sb);
@@ -1854,6 +1900,7 @@ repeat:
 
 	if (vma && userfaultfd_missing(vma)) {
 		*fault_type = handle_userfault(vmf, VM_UFFD_MISSING);
+		shmem_unmap_nofault_page(mapping, vmf->pgoff);
 		return 0;
 	}
 
@@ -1996,6 +2043,8 @@ clear:
 	}
 out:
 	*pagep = page + index - hindex;
+	if (vmf)
+		shmem_unmap_nofault_page(mapping, vmf->pgoff);
 	return 0;
 
 	/*
